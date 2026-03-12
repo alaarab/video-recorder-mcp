@@ -40,7 +40,7 @@ This server closes that gap.
 ## Core Features
 
 - starts Playwright browser sessions with recording enabled
-- exposes simple browser actions: navigate, click, fill, press, wait, screenshot
+- exposes browser actions with visible cursor treatment, slower pacing, and optional annotation overlays
 - closes browser sessions and exports a final video
 - transcodes browser recordings to `.mp4` when the output path ends in `.mp4`
 - starts and stops macOS screen recording through `ffmpeg`
@@ -52,8 +52,14 @@ This server closes that gap.
 ## Requirements
 
 - Node.js 20+
-- `ffmpeg` on `PATH`
+- `ffmpeg` on `PATH` for MP4 export, analysis, and composition
 - macOS for screen recording
+- Chromium installed for Playwright-based browser capture and title-card rendering
+- OS-level screen recording permission if you want desktop capture
+
+Browser demos work on any machine Playwright supports.
+
+Desktop capture currently targets macOS through AVFoundation.
 
 Playwright browser recording also needs browser binaries:
 
@@ -106,6 +112,8 @@ If you installed it globally through npm, point `args` to the installed entrypoi
 - `browser_click`
 - `browser_fill`
 - `browser_press`
+- `browser_annotate`
+- `browser_clear_annotations`
 - `browser_wait_for`
 - `browser_screenshot`
 - `close_browser_session`
@@ -119,13 +127,23 @@ If you installed it globally through npm, point `args` to the installed entrypoi
 1. Start a browser session with recording enabled.
 2. Navigate to your app.
 3. Fill login fields, click through the flow, create/update something.
-4. Close the session with:
+4. Use `browser_annotate` only when you need to focus the viewer on one thing.
+5. Close the session with:
 
 ```text
 saveAs: "~/Movies/Codex Recordings/demo.mp4"
 ```
 
 If `saveAs` ends in `.mp4`, the server will transcode the Playwright WebM output to H.264 MP4 through `ffmpeg`.
+
+Browser sessions default to demo-oriented behavior:
+
+- visible synthetic cursor in the recorded page
+- slower click and typing pacing
+- short post-action settling time so pages can breathe
+- annotation overlays for spotlight or outline moments
+
+If you want a faster or more mechanical pass, set `demoMode: false` when starting the browser session.
 
 ### Desktop App Demo
 
@@ -158,12 +176,23 @@ This is especially useful when paired with tools like `LiveMCP` for Ableton Live
 The composer is built for the practical cleanup pass after recording:
 
 - trim by `startTime` and `endTime`
+- keep a little comprehension room with `preRoll` and `postRoll`
+- zoom a clip toward the important area with `zoomScale`, `focusX`, and `focusY`
 - add `label` and `subtitle` cards before important sections
 - add `introTitle` and `outroTitle`
+- use `cardStyle: "minimal"` when you want calm black-and-white cards
 - choose transitions like `fade`, `slideleft`, `slideright`, `wipeleft`, or `circleopen`
 - keep temp assets only when `keepAssets` is explicitly set to `true`
 
 Original input recordings are never deleted by the server.
+
+## Quality Notes
+
+- Leave viewers enough time to understand a page before jumping to the next action.
+- Show the cursor when the recording needs to feel human and traceable.
+- Use annotations sparingly. They work best for one point of emphasis, not for every click.
+- Short overlays read better than dense commentary.
+- The default `minimal` card style is intentionally plain because readable black-and-white cards often cut better into product footage than glossy presentation slides.
 
 ## Example Use Cases
 
@@ -201,6 +230,7 @@ Composed demo videos default to:
 - browser automation is intentionally low-level and generic
 - screen recording depends on `ffmpeg` and OS-level capture permissions
 - title cards are rendered through Playwright, so Chromium needs to be installed
+- browser cursor and annotations are synthetic overlays inside the captured page, not the operating system cursor
 
 ## Development Notes
 

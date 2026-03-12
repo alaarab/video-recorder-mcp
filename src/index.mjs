@@ -18,7 +18,7 @@ const execFile = promisify(execFileCallback);
 const server = new Server(
   {
     name: "video-recorder-mcp",
-    version: "0.3.0"
+    version: "0.4.0"
   },
   {
     capabilities: {
@@ -174,6 +174,332 @@ async function closeBrowserSession(sessionId, saveAs) {
   };
 }
 
+function getBrowserSession(sessionId) {
+  const session = browserSessions.get(sessionId);
+  if (!session) {
+    throw new Error(`Unknown browser session: ${sessionId}`);
+  }
+
+  return session;
+}
+
+function createBrowserDemoProfile(args, width, height) {
+  return {
+    demoMode: args.demoMode !== false,
+    showCursor: args.showCursor !== false,
+    actionDelayMs: resolveSessionMs(args.actionDelayMs, 650),
+    typingDelayMs: resolveSessionMs(args.typingDelayMs, 82),
+    navigationSettlingMs: resolveSessionMs(args.navigationSettlingMs, 1150),
+    clickHoldMs: resolveSessionMs(args.clickHoldMs, 110),
+    moveDurationMs: resolveSessionMs(args.moveDurationMs, 420),
+    annotationDurationMs: resolveSessionMs(args.annotationDurationMs, 1800),
+    cursorPosition: {
+      x: roundNumber(width * 0.16, 1),
+      y: roundNumber(height * 0.18, 1)
+    }
+  };
+}
+
+async function waitForBrowserDelay(session, baseMs, ratio = 0.18) {
+  const delayMs = jitterMs(baseMs, ratio);
+  if (delayMs > 0) {
+    await session.page.waitForTimeout(delayMs);
+  }
+  return delayMs;
+}
+
+async function ensureBrowserDemoOverlay(session) {
+  if (!session.demoMode) {
+    return;
+  }
+
+  await session.page.evaluate(({ showCursor }) => {
+    const rootId = "__video-recorder-demo-root";
+    const styleId = "__video-recorder-demo-style";
+    if (!document.getElementById(styleId)) {
+      const style = document.createElement("style");
+      style.id = styleId;
+      style.textContent = `
+        #${rootId} {
+          position: fixed;
+          inset: 0;
+          z-index: 2147483647;
+          pointer-events: none;
+          overflow: hidden;
+        }
+
+        #${rootId} .vrdemo-cursor {
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 22px;
+          height: 22px;
+          margin-left: -11px;
+          margin-top: -11px;
+          border-radius: 999px;
+          background: rgba(10, 10, 10, 0.88);
+          border: 2px solid rgba(255, 255, 255, 0.96);
+          box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          opacity: 0;
+          transform: translate(-80px, -80px);
+        }
+
+        #${rootId} .vrdemo-cursor::after {
+          content: "";
+          width: 4px;
+          height: 4px;
+          border-radius: 999px;
+          background: rgba(255, 255, 255, 0.96);
+        }
+
+        #${rootId} .vrdemo-layer {
+          position: absolute;
+          inset: 0;
+        }
+
+        #${rootId} .vrdemo-ripple {
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 20px;
+          height: 20px;
+          margin-left: -10px;
+          margin-top: -10px;
+          border-radius: 999px;
+          border: 2px solid rgba(255, 255, 255, 0.95);
+          background: rgba(0, 0, 0, 0.14);
+          box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.28);
+        }
+
+        #${rootId} .vrdemo-annotation {
+          position: absolute;
+          border-radius: 18px;
+          border: 2px solid rgba(255, 255, 255, 0.98);
+          box-shadow:
+            0 0 0 1px rgba(0, 0, 0, 0.35) inset,
+            0 18px 38px rgba(0, 0, 0, 0.18);
+        }
+
+        #${rootId} .vrdemo-annotation[data-style="outline"] {
+          background: rgba(255, 255, 255, 0.02);
+        }
+
+        #${rootId} .vrdemo-annotation[data-style="spotlight"] {
+          background: rgba(255, 255, 255, 0.03);
+          box-shadow:
+            0 0 0 9999px rgba(0, 0, 0, 0.45),
+            0 0 0 2px rgba(255, 255, 255, 0.98),
+            0 20px 56px rgba(0, 0, 0, 0.26);
+        }
+
+        #${rootId} .vrdemo-label {
+          position: absolute;
+          max-width: 360px;
+          padding: 10px 14px;
+          border-radius: 14px;
+          background: rgba(10, 10, 10, 0.94);
+          color: rgba(255, 255, 255, 0.98);
+          font-family: "SF Pro Display", "Inter", "Helvetica Neue", sans-serif;
+          font-size: 15px;
+          line-height: 1.35;
+          letter-spacing: -0.01em;
+          box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22);
+        }
+      `;
+      document.head.append(style);
+    }
+
+    let root = document.getElementById(rootId);
+    if (!root) {
+      root = document.createElement("div");
+      root.id = rootId;
+      root.innerHTML = `
+        <div class="vrdemo-layer" data-layer="annotations"></div>
+        <div class="vrdemo-cursor" data-layer="cursor"></div>
+      `;
+      document.documentElement.append(root);
+    }
+
+    const cursor = root.querySelector('[data-layer="cursor"]');
+    if (cursor) {
+      cursor.style.display = showCursor ? "flex" : "none";
+    }
+  }, { showCursor: session.showCursor });
+}
+
+async function moveBrowserCursor(session, x, y, options = {}) {
+  if (!session.demoMode || !session.showCursor) {
+    return { x, y };
+  }
+
+  await ensureBrowserDemoOverlay(session);
+  const durationMs = resolveSessionMs(options.durationMs, session.moveDurationMs);
+  const dx = session.cursorPosition ? x - session.cursorPosition.x : 0;
+  const dy = session.cursorPosition ? y - session.cursorPosition.y : 0;
+  const distance = Math.hypot(dx, dy);
+  const steps = Math.max(8, Math.ceil(distance / 30));
+
+  await Promise.all([
+    session.page.mouse.move(x, y, { steps }),
+    session.page.evaluate(({ xPos, yPos, moveMs }) => new Promise((resolve) => {
+      const cursor = document.querySelector("#__video-recorder-demo-root .vrdemo-cursor");
+      if (!cursor) {
+        resolve();
+        return;
+      }
+
+      cursor.style.opacity = "1";
+      cursor.style.transition = `transform ${moveMs}ms cubic-bezier(0.22, 1, 0.36, 1), opacity 120ms ease`;
+      cursor.style.transform = `translate(${xPos}px, ${yPos}px)`;
+      window.setTimeout(resolve, moveMs + 24);
+    }), {
+      xPos: x,
+      yPos: y,
+      moveMs: durationMs
+    })
+  ]);
+
+  session.cursorPosition = { x, y };
+  return session.cursorPosition;
+}
+
+async function playBrowserClickEffect(session, x, y) {
+  if (!session.demoMode) {
+    return;
+  }
+
+  await ensureBrowserDemoOverlay(session);
+  await session.page.evaluate(({ xPos, yPos }) => new Promise((resolve) => {
+    const layer = document.querySelector('#__video-recorder-demo-root [data-layer="annotations"]');
+    if (!layer) {
+      resolve();
+      return;
+    }
+
+    const ripple = document.createElement("div");
+    ripple.className = "vrdemo-ripple";
+    ripple.style.transform = `translate(${xPos}px, ${yPos}px) scale(0.4)`;
+    ripple.style.opacity = "0.92";
+    ripple.style.transition = "transform 260ms ease, opacity 260ms ease";
+    layer.append(ripple);
+
+    requestAnimationFrame(() => {
+      ripple.style.transform = `translate(${xPos}px, ${yPos}px) scale(1.8)`;
+      ripple.style.opacity = "0";
+    });
+
+    window.setTimeout(() => {
+      ripple.remove();
+      resolve();
+    }, 280);
+  }), {
+    xPos: x,
+    yPos: y
+  });
+}
+
+async function resolveBrowserTarget(session, selector) {
+  const locator = session.page.locator(selector).first();
+  await locator.waitFor({ state: "visible" });
+  await locator.scrollIntoViewIfNeeded();
+  const box = await locator.boundingBox();
+  if (!box) {
+    throw new Error(`Could not resolve a visible box for selector: ${selector}`);
+  }
+
+  return {
+    locator,
+    box,
+    x: roundNumber(box.x + (box.width / 2), 2),
+    y: roundNumber(box.y + (box.height / 2), 2)
+  };
+}
+
+async function annotateBrowserRegion(session, rect, options = {}) {
+  if (!session.demoMode) {
+    return { shown: false };
+  }
+
+  await ensureBrowserDemoOverlay(session);
+  const padding = resolveSessionMs(options.padding, 12);
+  const durationMs = resolveSessionMs(options.durationMs, session.annotationDurationMs);
+  const left = Math.max(0, rect.x - padding);
+  const top = Math.max(0, rect.y - padding);
+  const width = rect.width + (padding * 2);
+  const height = rect.height + (padding * 2);
+
+  await session.page.evaluate((annotation) => new Promise((resolve) => {
+    const layer = document.querySelector('#__video-recorder-demo-root [data-layer="annotations"]');
+    if (!layer) {
+      resolve();
+      return;
+    }
+
+    const wrapper = document.createElement("div");
+    const box = document.createElement("div");
+    box.className = "vrdemo-annotation";
+    box.dataset.style = annotation.style;
+    box.style.left = `${annotation.left}px`;
+    box.style.top = `${annotation.top}px`;
+    box.style.width = `${annotation.width}px`;
+    box.style.height = `${annotation.height}px`;
+    wrapper.append(box);
+
+    if (annotation.text) {
+      const label = document.createElement("div");
+      label.className = "vrdemo-label";
+      label.textContent = annotation.text;
+      label.style.left = `${annotation.left}px`;
+      label.style.top = `${Math.max(16, annotation.top - 56)}px`;
+      wrapper.append(label);
+    }
+
+    layer.append(wrapper);
+    if (annotation.durationMs <= 0) {
+      resolve();
+      return;
+    }
+
+    window.setTimeout(() => {
+      wrapper.remove();
+      resolve();
+    }, annotation.durationMs);
+  }), {
+    left,
+    top,
+    width,
+    height,
+    text: options.text || "",
+    style: options.style || "outline",
+    durationMs
+  });
+
+  return {
+    shown: true,
+    left,
+    top,
+    width,
+    height,
+    durationMs
+  };
+}
+
+async function clearBrowserAnnotations(session) {
+  if (!session.demoMode) {
+    return;
+  }
+
+  await session.page.evaluate(() => {
+    const layer = document.querySelector('#__video-recorder-demo-root [data-layer="annotations"]');
+    if (layer) {
+      layer.replaceChildren();
+    }
+  });
+}
+
 function sanitizeFileStem(filePath) {
   return path.basename(filePath, path.extname(filePath)).replace(/[^a-zA-Z0-9._-]+/g, "-");
 }
@@ -203,6 +529,23 @@ function roundNumber(value, places = 3) {
 
   const factor = 10 ** places;
   return Math.round(value * factor) / factor;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function jitterMs(baseMs, ratio = 0.18) {
+  if (!Number.isFinite(baseMs) || baseMs <= 0) {
+    return 0;
+  }
+
+  const variance = baseMs * ratio;
+  return Math.max(0, Math.round(baseMs + ((Math.random() * 2) - 1) * variance));
+}
+
+function resolveSessionMs(value, fallback) {
+  return Number.isFinite(value) ? Math.max(0, value) : fallback;
 }
 
 function timestampForFilename(seconds) {
@@ -433,6 +776,63 @@ function escapeHtml(text) {
 function buildTitleCardHtml(options = {}) {
   const title = escapeHtml(options.title || "Demo");
   const subtitle = options.subtitle ? escapeHtml(options.subtitle) : "";
+  const eyebrow = escapeHtml(options.eyebrow || "Demo");
+  const cardStyle = options.cardStyle || "minimal";
+
+  const theme = cardStyle === "glass"
+    ? {
+      pageBackground: `
+        radial-gradient(circle at 15% 20%, rgba(84, 221, 190, 0.28), transparent 28%),
+        radial-gradient(circle at 82% 18%, rgba(72, 131, 255, 0.24), transparent 24%),
+        radial-gradient(circle at 74% 80%, rgba(245, 111, 166, 0.20), transparent 28%),
+        linear-gradient(140deg, #07111f 0%, #101a2d 48%, #050a14 100%)
+      `,
+      frameCss: `
+        border-radius: 36px;
+        background: linear-gradient(160deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+        backdrop-filter: blur(20px);
+      `,
+      eyebrowCss: `
+        background: rgba(255, 255, 255, 0.08);
+        color: #8fe6d5;
+      `,
+      titleColor: "#f5f7fb",
+      subtitleColor: "#b6c3d8"
+    }
+    : cardStyle === "light"
+      ? {
+        pageBackground: "#f3f2ee",
+        frameCss: `
+          border-radius: 32px;
+          background: rgba(255, 255, 255, 0.92);
+          border: 1px solid rgba(17, 17, 17, 0.08);
+          box-shadow: 0 24px 60px rgba(17, 17, 17, 0.08);
+        `,
+        eyebrowCss: `
+          background: rgba(17, 17, 17, 0.06);
+          color: #171717;
+        `,
+        titleColor: "#0f0f0f",
+        subtitleColor: "#444444"
+      }
+      : {
+        pageBackground: "#050505",
+        frameCss: `
+          border-radius: 0;
+          background: transparent;
+          border-top: 1px solid rgba(255, 255, 255, 0.18);
+          border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+        `,
+        eyebrowCss: `
+          background: transparent;
+          color: rgba(255, 255, 255, 0.78);
+          border: 1px solid rgba(255, 255, 255, 0.16);
+        `,
+        titleColor: "#fafafa",
+        subtitleColor: "rgba(255, 255, 255, 0.72)"
+      };
 
   return `<!doctype html>
 <html>
@@ -452,11 +852,7 @@ function buildTitleCardHtml(options = {}) {
         height: 100%;
         margin: 0;
         overflow: hidden;
-        background:
-          radial-gradient(circle at 15% 20%, rgba(84, 221, 190, 0.28), transparent 28%),
-          radial-gradient(circle at 82% 18%, rgba(72, 131, 255, 0.24), transparent 24%),
-          radial-gradient(circle at 74% 80%, rgba(245, 111, 166, 0.20), transparent 28%),
-          linear-gradient(140deg, #07111f 0%, #101a2d 48%, #050a14 100%);
+        background: ${theme.pageBackground};
         font-family: "SF Pro Display", "Inter", "Helvetica Neue", sans-serif;
       }
 
@@ -471,11 +867,7 @@ function buildTitleCardHtml(options = {}) {
         width: calc(100% - 120px);
         min-height: 46%;
         padding: 56px 64px;
-        border-radius: 36px;
-        background: linear-gradient(160deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
-        border: 1px solid rgba(255, 255, 255, 0.14);
-        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
-        backdrop-filter: blur(20px);
+        ${theme.frameCss}
       }
 
       .eyebrow {
@@ -483,17 +875,16 @@ function buildTitleCardHtml(options = {}) {
         margin-bottom: 24px;
         padding: 10px 16px;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.08);
-        color: #8fe6d5;
         font-size: 18px;
         letter-spacing: 0.12em;
         text-transform: uppercase;
+        ${theme.eyebrowCss}
       }
 
       h1 {
         margin: 0;
         max-width: 900px;
-        color: #f5f7fb;
+        color: ${theme.titleColor};
         font-size: 76px;
         line-height: 0.94;
         letter-spacing: -0.04em;
@@ -503,7 +894,7 @@ function buildTitleCardHtml(options = {}) {
       p {
         margin: 24px 0 0;
         max-width: 820px;
-        color: #b6c3d8;
+        color: ${theme.subtitleColor};
         font-size: 28px;
         line-height: 1.3;
         letter-spacing: -0.02em;
@@ -512,7 +903,7 @@ function buildTitleCardHtml(options = {}) {
   </head>
   <body>
     <section class="frame">
-      <div class="eyebrow">Demo Edit</div>
+      <div class="eyebrow">${eyebrow}</div>
       <h1>${title}</h1>
       ${subtitle ? `<p>${subtitle}</p>` : ""}
     </section>
@@ -607,11 +998,33 @@ async function normalizeClip(inputPath, outputPath, options = {}) {
   const height = Number.isFinite(options.height) ? options.height : 900;
   const fps = Number.isFinite(options.fps) ? options.fps : 30;
   const keepAudio = options.keepAudio !== false;
-  const startTime = Number.isFinite(options.startTime) ? options.startTime : null;
-  const endTime = Number.isFinite(options.endTime) ? options.endTime : null;
-  const trimDuration = startTime !== null && endTime !== null && endTime > startTime
-    ? endTime - startTime
+  const preRoll = Number.isFinite(options.preRoll) ? Math.max(0, options.preRoll) : 0.25;
+  const postRoll = Number.isFinite(options.postRoll) ? Math.max(0, options.postRoll) : 0.45;
+  const requestedStart = Number.isFinite(options.startTime) ? Math.max(0, options.startTime) : null;
+  const requestedEnd = Number.isFinite(options.endTime) ? Math.max(0, options.endTime) : null;
+  const startTime = requestedStart !== null
+    ? Math.max(0, requestedStart - preRoll)
     : null;
+  const endTime = requestedEnd !== null
+    ? Math.min(probe.durationSeconds || requestedEnd + postRoll, requestedEnd + postRoll)
+    : null;
+  const trimDuration = endTime !== null
+    ? Math.max(0.05, endTime - (startTime ?? 0))
+    : null;
+  const zoomScale = Number.isFinite(options.zoomScale) ? clamp(options.zoomScale, 1, 4) : 1;
+  const focusX = Number.isFinite(options.focusX) ? clamp(options.focusX, 0, 1) : 0.5;
+  const focusY = Number.isFinite(options.focusY) ? clamp(options.focusY, 0, 1) : 0.5;
+  let videoFilter = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`;
+
+  if (zoomScale > 1.001) {
+    const zoomedWidth = Math.round(width * zoomScale);
+    const zoomedHeight = Math.round(height * zoomScale);
+    const cropX = Math.round((zoomedWidth - width) * focusX);
+    const cropY = Math.round((zoomedHeight - height) * focusY);
+    videoFilter += `,scale=${zoomedWidth}:${zoomedHeight},crop=${width}:${height}:${cropX}:${cropY}`;
+  }
+
+  videoFilter += ",format=yuv420p";
 
   const ffmpegArgs = ["-y"];
   if (startTime !== null) {
@@ -628,7 +1041,7 @@ async function normalizeClip(inputPath, outputPath, options = {}) {
 
   ffmpegArgs.push(
     "-vf",
-    `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p`,
+    videoFilter,
     "-map",
     "0:v:0"
   );
@@ -685,9 +1098,10 @@ async function composeDemoVideo(clips, options = {}) {
   const fps = Number.isFinite(options.fps) ? options.fps : 30;
   const keepAudio = options.keepAudio !== false;
   const keepAssets = options.keepAssets === true;
-  const cardDuration = Number.isFinite(options.cardDuration) ? options.cardDuration : 1.8;
-  const labelCardDuration = Number.isFinite(options.labelCardDuration) ? options.labelCardDuration : 1.2;
+  const cardDuration = Number.isFinite(options.cardDuration) ? options.cardDuration : 2.2;
+  const labelCardDuration = Number.isFinite(options.labelCardDuration) ? options.labelCardDuration : 1.6;
   const transition = options.transition || "fade";
+  const cardStyle = options.cardStyle || "minimal";
   const stamp = new Date().toISOString().replaceAll(":", "-");
   const defaultOutputPath = path.join(os.homedir(), "Movies", "Codex Recordings", `demo-${stamp}.mp4`);
   const outputPath = path.resolve(expandHome(options.outputPath || defaultOutputPath));
@@ -704,6 +1118,8 @@ async function composeDemoVideo(clips, options = {}) {
       fps,
       duration: cardDuration,
       keepAudio,
+      cardStyle,
+      eyebrow: options.eyebrow || "Intro",
       title: options.introTitle,
       subtitle: options.introSubtitle
     });
@@ -721,6 +1137,9 @@ async function composeDemoVideo(clips, options = {}) {
     if (!clip?.inputPath) {
       throw new Error(`Clip ${index + 1} is missing inputPath.`);
     }
+    if (Number.isFinite(clip.startTime) && Number.isFinite(clip.endTime) && clip.endTime <= clip.startTime) {
+      throw new Error(`Clip ${index + 1} has endTime <= startTime.`);
+    }
 
     if (clip.label) {
       const labelPath = path.join(workDir, `segment-${String(segments.length).padStart(3, "0")}-label.mp4`);
@@ -730,6 +1149,8 @@ async function composeDemoVideo(clips, options = {}) {
         fps,
         duration: labelCardDuration,
         keepAudio,
+        cardStyle,
+        eyebrow: "Section",
         title: clip.label,
         subtitle: clip.subtitle
       });
@@ -749,7 +1170,12 @@ async function composeDemoVideo(clips, options = {}) {
       fps,
       keepAudio,
       startTime: clip.startTime,
-      endTime: clip.endTime
+      endTime: clip.endTime,
+      preRoll: clip.preRoll,
+      postRoll: clip.postRoll,
+      zoomScale: clip.zoomScale,
+      focusX: clip.focusX,
+      focusY: clip.focusY
     });
     segments.push({
       kind: "clip",
@@ -767,6 +1193,8 @@ async function composeDemoVideo(clips, options = {}) {
       fps,
       duration: cardDuration,
       keepAudio,
+      cardStyle,
+      eyebrow: options.outroEyebrow || "Outro",
       title: options.outroTitle,
       subtitle: options.outroSubtitle
     });
@@ -958,7 +1386,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           headless: { type: "boolean", default: false },
           width: { type: "number", default: 1440 },
           height: { type: "number", default: 900 },
-          recordDir: { type: "string" }
+          recordDir: { type: "string" },
+          demoMode: { type: "boolean", default: true },
+          showCursor: { type: "boolean", default: true },
+          actionDelayMs: { type: "number", default: 650 },
+          typingDelayMs: { type: "number", default: 82 },
+          navigationSettlingMs: { type: "number", default: 1150 },
+          clickHoldMs: { type: "number", default: 110 },
+          moveDurationMs: { type: "number", default: 420 },
+          annotationDurationMs: { type: "number", default: 1800 }
         }
       }
     },
@@ -970,7 +1406,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["sessionId", "url"],
         properties: {
           sessionId: { type: "string" },
-          url: { type: "string" }
+          url: { type: "string" },
+          settleMs: { type: "number" }
         }
       }
     },
@@ -982,7 +1419,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["sessionId", "selector"],
         properties: {
           sessionId: { type: "string" },
-          selector: { type: "string" }
+          selector: { type: "string" },
+          settleMs: { type: "number" },
+          moveDurationMs: { type: "number" },
+          annotationText: { type: "string" },
+          annotationStyle: { type: "string", enum: ["outline", "spotlight"] }
         }
       }
     },
@@ -995,7 +1436,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           sessionId: { type: "string" },
           selector: { type: "string" },
-          value: { type: "string" }
+          value: { type: "string" },
+          typingDelayMs: { type: "number" },
+          clearFirst: { type: "boolean", default: true },
+          settleMs: { type: "number" }
         }
       }
     },
@@ -1008,7 +1452,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           sessionId: { type: "string" },
           key: { type: "string" },
-          selector: { type: "string" }
+          selector: { type: "string" },
+          settleMs: { type: "number" }
+        }
+      }
+    },
+    {
+      name: "browser_annotate",
+      description: "Draw an outline or spotlight around a selector or explicit rectangle inside the page recording.",
+      inputSchema: {
+        type: "object",
+        required: ["sessionId"],
+        properties: {
+          sessionId: { type: "string" },
+          selector: { type: "string" },
+          x: { type: "number" },
+          y: { type: "number" },
+          width: { type: "number" },
+          height: { type: "number" },
+          text: { type: "string" },
+          style: { type: "string", enum: ["outline", "spotlight"], default: "outline" },
+          durationMs: { type: "number", default: 1800 },
+          padding: { type: "number", default: 12 }
+        }
+      }
+    },
+    {
+      name: "browser_clear_annotations",
+      description: "Remove any active browser demo annotations from the recorded page.",
+      inputSchema: {
+        type: "object",
+        required: ["sessionId"],
+        properties: {
+          sessionId: { type: "string" }
         }
       }
     },
@@ -1084,6 +1560,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 inputPath: { type: "string" },
                 startTime: { type: "number" },
                 endTime: { type: "number" },
+                preRoll: { type: "number" },
+                postRoll: { type: "number" },
+                zoomScale: { type: "number" },
+                focusX: { type: "number" },
+                focusY: { type: "number" },
                 label: { type: "string" },
                 subtitle: { type: "string" }
               }
@@ -1102,10 +1583,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           transitionDuration: { type: "number", default: 0.4 },
           introTitle: { type: "string" },
           introSubtitle: { type: "string" },
+          eyebrow: { type: "string" },
           outroTitle: { type: "string" },
           outroSubtitle: { type: "string" },
-          cardDuration: { type: "number", default: 1.8 },
-          labelCardDuration: { type: "number", default: 1.2 },
+          outroEyebrow: { type: "string" },
+          cardStyle: { type: "string", enum: ["minimal", "glass", "light"], default: "minimal" },
+          cardDuration: { type: "number", default: 2.2 },
+          labelCardDuration: { type: "number", default: 1.6 },
           keepAssets: { type: "boolean", default: false }
         }
       }
@@ -1193,6 +1677,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const height = Number.isFinite(args.height) ? args.height : 900;
     const recordDir = path.resolve(expandHome(args.recordDir || path.join(os.homedir(), "Movies", "Codex Recordings", "browser-temp")));
     ensureDir(recordDir);
+    const demoProfile = createBrowserDemoProfile(args, width, height);
 
     const browser = await engine.launch({
       headless: args.headless === true
@@ -1205,73 +1690,175 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     });
     const page = await context.newPage();
-    if (args.url) {
-      await page.goto(args.url, { waitUntil: "domcontentloaded" });
-    }
-
-    browserSessions.set(sessionId, {
+    const session = {
       browser,
       context,
       page,
-      recordDir
-    });
+      recordDir,
+      ...demoProfile
+    };
+    browserSessions.set(sessionId, session);
+
+    if (args.url) {
+      await page.goto(args.url, { waitUntil: "domcontentloaded" });
+    }
+    await ensureBrowserDemoOverlay(session);
+    if (session.showCursor) {
+      await moveBrowserCursor(session, session.cursorPosition.x, session.cursorPosition.y, { durationMs: 0 });
+    }
+    if (args.url && session.demoMode) {
+      await waitForBrowserDelay(session, session.navigationSettlingMs, 0.1);
+    }
 
     return textResult({
       sessionId,
       browser: browserName,
       url: args.url || null,
-      recordDir
+      recordDir,
+      demoMode: session.demoMode,
+      showCursor: session.showCursor
     });
   }
 
   if (name === "browser_navigate") {
-    const session = browserSessions.get(args.sessionId);
-    if (!session) {
-      throw new Error(`Unknown browser session: ${args.sessionId}`);
-    }
+    const session = getBrowserSession(args.sessionId);
     await session.page.goto(args.url, { waitUntil: "domcontentloaded" });
+    await ensureBrowserDemoOverlay(session);
+    if (session.showCursor && session.cursorPosition) {
+      await moveBrowserCursor(session, session.cursorPosition.x, session.cursorPosition.y, { durationMs: 0 });
+    }
+    const settleMs = resolveSessionMs(args.settleMs, session.navigationSettlingMs);
+    if (session.demoMode) {
+      await waitForBrowserDelay(session, settleMs, 0.1);
+    }
     return textResult({ sessionId: args.sessionId, url: session.page.url() });
   }
 
   if (name === "browser_click") {
-    const session = browserSessions.get(args.sessionId);
-    if (!session) {
-      throw new Error(`Unknown browser session: ${args.sessionId}`);
+    const session = getBrowserSession(args.sessionId);
+    const target = await resolveBrowserTarget(session, args.selector);
+    if (session.demoMode) {
+      await moveBrowserCursor(session, target.x, target.y, { durationMs: args.moveDurationMs });
+      if (args.annotationText) {
+        await annotateBrowserRegion(session, target.box, {
+          text: args.annotationText,
+          style: args.annotationStyle || "outline",
+          durationMs: Math.min(session.annotationDurationMs, 1000)
+        });
+      }
+      await waitForBrowserDelay(session, session.clickHoldMs, 0.14);
+      await Promise.all([
+        playBrowserClickEffect(session, target.x, target.y),
+        target.locator.click({ delay: session.clickHoldMs })
+      ]);
+      await waitForBrowserDelay(session, resolveSessionMs(args.settleMs, session.actionDelayMs), 0.16);
+    } else {
+      await target.locator.click();
     }
-    await session.page.click(args.selector);
     return textResult({ sessionId: args.sessionId, selector: args.selector, clicked: true });
   }
 
   if (name === "browser_fill") {
-    const session = browserSessions.get(args.sessionId);
-    if (!session) {
-      throw new Error(`Unknown browser session: ${args.sessionId}`);
+    const session = getBrowserSession(args.sessionId);
+    const target = await resolveBrowserTarget(session, args.selector);
+    const clearFirst = args.clearFirst !== false;
+    if (session.demoMode) {
+      await moveBrowserCursor(session, target.x, target.y);
+      await waitForBrowserDelay(session, session.clickHoldMs, 0.12);
+      await Promise.all([
+        playBrowserClickEffect(session, target.x, target.y),
+        target.locator.click({ delay: session.clickHoldMs })
+      ]);
+      if (clearFirst) {
+        const modifier = process.platform === "darwin" ? "Meta" : "Control";
+        await session.page.keyboard.press(`${modifier}+A`);
+        await session.page.waitForTimeout(70);
+        await session.page.keyboard.press("Backspace");
+      }
+
+      await session.page.keyboard.type(args.value, {
+        delay: resolveSessionMs(args.typingDelayMs, session.typingDelayMs)
+      });
+      await waitForBrowserDelay(session, resolveSessionMs(args.settleMs, Math.max(260, session.actionDelayMs - 140)), 0.14);
+    } else {
+      await target.locator.fill(args.value);
     }
-    await session.page.fill(args.selector, args.value);
     return textResult({ sessionId: args.sessionId, selector: args.selector, filled: true });
   }
 
   if (name === "browser_press") {
-    const session = browserSessions.get(args.sessionId);
-    if (!session) {
-      throw new Error(`Unknown browser session: ${args.sessionId}`);
-    }
+    const session = getBrowserSession(args.sessionId);
     if (args.selector) {
-      await session.page.press(args.selector, args.key);
+      const target = await resolveBrowserTarget(session, args.selector);
+      if (session.demoMode) {
+        await moveBrowserCursor(session, target.x, target.y);
+        await waitForBrowserDelay(session, session.clickHoldMs, 0.12);
+        await Promise.all([
+          playBrowserClickEffect(session, target.x, target.y),
+          target.locator.click({ delay: session.clickHoldMs })
+        ]);
+        await target.locator.press(args.key);
+        await waitForBrowserDelay(session, resolveSessionMs(args.settleMs, Math.max(220, session.actionDelayMs - 180)), 0.12);
+      } else {
+        await target.locator.press(args.key);
+      }
     } else {
       await session.page.keyboard.press(args.key);
+      if (session.demoMode) {
+        await waitForBrowserDelay(session, resolveSessionMs(args.settleMs, Math.max(180, session.actionDelayMs - 220)), 0.12);
+      }
     }
     return textResult({ sessionId: args.sessionId, key: args.key, selector: args.selector || null });
   }
 
-  if (name === "browser_wait_for") {
-    const session = browserSessions.get(args.sessionId);
-    if (!session) {
-      throw new Error(`Unknown browser session: ${args.sessionId}`);
+  if (name === "browser_annotate") {
+    const session = getBrowserSession(args.sessionId);
+    let rect = null;
+
+    if (args.selector) {
+      const target = await resolveBrowserTarget(session, args.selector);
+      rect = target.box;
+      if (session.demoMode && session.showCursor) {
+        await moveBrowserCursor(session, target.x, target.y, { durationMs: 260 });
+      }
+    } else if ([args.x, args.y, args.width, args.height].every((value) => Number.isFinite(value))) {
+      rect = {
+        x: args.x,
+        y: args.y,
+        width: args.width,
+        height: args.height
+      };
+    } else {
+      throw new Error("browser_annotate requires either selector or x/y/width/height.");
     }
+
+    const annotation = await annotateBrowserRegion(session, rect, {
+      text: args.text,
+      style: args.style || "outline",
+      durationMs: args.durationMs,
+      padding: args.padding
+    });
+
+    return textResult({
+      sessionId: args.sessionId,
+      ...annotation
+    });
+  }
+
+  if (name === "browser_clear_annotations") {
+    const session = getBrowserSession(args.sessionId);
+    await clearBrowserAnnotations(session);
+    return textResult({ sessionId: args.sessionId, cleared: true });
+  }
+
+  if (name === "browser_wait_for") {
+    const session = getBrowserSession(args.sessionId);
     const timeoutMs = Number.isFinite(args.timeoutMs) ? args.timeoutMs : 1000;
     if (args.selector) {
       await session.page.waitForSelector(args.selector, { timeout: timeoutMs });
+      if (session.demoMode) {
+        await waitForBrowserDelay(session, Math.min(timeoutMs, 260), 0.08);
+      }
     } else {
       await session.page.waitForTimeout(timeoutMs);
     }
