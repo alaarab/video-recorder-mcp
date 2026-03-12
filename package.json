@@ -1,0 +1,26 @@
+{
+  "name": "@alaarab/video-recorder-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for browser video recording and macOS screen capture",
+  "type": "module",
+  "license": "MIT",
+  "author": "alaarab",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alaarab/video-recorder-mcp.git"
+  },
+  "homepage": "https://github.com/alaarab/video-recorder-mcp",
+  "bugs": {
+    "url": "https://github.com/alaarab/video-recorder-mcp/issues"
+  },
+  "bin": {
+    "video-recorder-mcp": "./src/index.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.1",
+    "playwright": "^1.54.2"
+  }
+}
