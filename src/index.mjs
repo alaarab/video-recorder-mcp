@@ -18,7 +18,7 @@ const execFile = promisify(execFileCallback);
 const server = new Server(
   {
     name: "video-recorder-mcp",
-    version: "0.1.0"
+    version: "0.3.0"
   },
   {
     capabilities: {
@@ -421,6 +421,498 @@ async function analyzeVideo(inputPath, options = {}) {
   return manifest;
 }
 
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildTitleCardHtml(options = {}) {
+  const title = escapeHtml(options.title || "Demo");
+  const subtitle = options.subtitle ? escapeHtml(options.subtitle) : "";
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html, body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 15% 20%, rgba(84, 221, 190, 0.28), transparent 28%),
+          radial-gradient(circle at 82% 18%, rgba(72, 131, 255, 0.24), transparent 24%),
+          radial-gradient(circle at 74% 80%, rgba(245, 111, 166, 0.20), transparent 28%),
+          linear-gradient(140deg, #07111f 0%, #101a2d 48%, #050a14 100%);
+        font-family: "SF Pro Display", "Inter", "Helvetica Neue", sans-serif;
+      }
+
+      body {
+        position: relative;
+        display: grid;
+        place-items: center;
+      }
+
+      .frame {
+        position: relative;
+        width: calc(100% - 120px);
+        min-height: 46%;
+        padding: 56px 64px;
+        border-radius: 36px;
+        background: linear-gradient(160deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+        backdrop-filter: blur(20px);
+      }
+
+      .eyebrow {
+        display: inline-block;
+        margin-bottom: 24px;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        color: #8fe6d5;
+        font-size: 18px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        max-width: 900px;
+        color: #f5f7fb;
+        font-size: 76px;
+        line-height: 0.94;
+        letter-spacing: -0.04em;
+        font-weight: 740;
+      }
+
+      p {
+        margin: 24px 0 0;
+        max-width: 820px;
+        color: #b6c3d8;
+        font-size: 28px;
+        line-height: 1.3;
+        letter-spacing: -0.02em;
+      }
+    </style>
+  </head>
+  <body>
+    <section class="frame">
+      <div class="eyebrow">Demo Edit</div>
+      <h1>${title}</h1>
+      ${subtitle ? `<p>${subtitle}</p>` : ""}
+    </section>
+  </body>
+</html>`;
+}
+
+async function createTitleCardClip(outputPath, options = {}) {
+  const width = Number.isFinite(options.width) ? options.width : 1440;
+  const height = Number.isFinite(options.height) ? options.height : 900;
+  const fps = Number.isFinite(options.fps) ? options.fps : 30;
+  const duration = Number.isFinite(options.duration) ? options.duration : 1.8;
+  const keepAudio = options.keepAudio !== false;
+  const pngPath = `${outputPath}.png`;
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({
+    viewport: { width, height },
+    deviceScaleFactor: 1
+  });
+
+  await page.setContent(buildTitleCardHtml(options), {
+    waitUntil: "load"
+  });
+  await page.screenshot({
+    path: pngPath,
+    type: "png"
+  });
+  await page.close();
+  await browser.close();
+
+  const ffmpegArgs = [
+    "-y",
+    "-loop",
+    "1",
+    "-i",
+    pngPath,
+    "-t",
+    String(duration)
+  ];
+
+  if (keepAudio) {
+    ffmpegArgs.push(
+      "-f",
+      "lavfi",
+      "-i",
+      "anullsrc=r=48000:cl=stereo"
+    );
+  }
+
+  ffmpegArgs.push(
+    "-vf",
+    `fps=${fps},format=yuv420p`,
+    "-map",
+    "0:v:0"
+  );
+
+  if (keepAudio) {
+    ffmpegArgs.push("-map", "1:a:0");
+  } else {
+    ffmpegArgs.push("-an");
+  }
+
+  ffmpegArgs.push(
+    "-shortest",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-r",
+    String(fps)
+  );
+
+  if (keepAudio) {
+    ffmpegArgs.push(
+      "-c:a",
+      "aac",
+      "-ar",
+      "48000",
+      "-ac",
+      "2"
+    );
+  }
+
+  ffmpegArgs.push(outputPath);
+  await execFile("ffmpeg", ffmpegArgs);
+}
+
+async function normalizeClip(inputPath, outputPath, options = {}) {
+  const resolvedInputPath = path.resolve(expandHome(inputPath));
+  const probe = await probeVideo(resolvedInputPath);
+  const width = Number.isFinite(options.width) ? options.width : 1440;
+  const height = Number.isFinite(options.height) ? options.height : 900;
+  const fps = Number.isFinite(options.fps) ? options.fps : 30;
+  const keepAudio = options.keepAudio !== false;
+  const startTime = Number.isFinite(options.startTime) ? options.startTime : null;
+  const endTime = Number.isFinite(options.endTime) ? options.endTime : null;
+  const trimDuration = startTime !== null && endTime !== null && endTime > startTime
+    ? endTime - startTime
+    : null;
+
+  const ffmpegArgs = ["-y"];
+  if (startTime !== null) {
+    ffmpegArgs.push("-ss", String(startTime));
+  }
+  ffmpegArgs.push("-i", resolvedInputPath);
+  if (trimDuration !== null) {
+    ffmpegArgs.push("-t", String(trimDuration));
+  }
+
+  if (keepAudio && !probe.audioStream) {
+    ffmpegArgs.push("-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo");
+  }
+
+  ffmpegArgs.push(
+    "-vf",
+    `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p`,
+    "-map",
+    "0:v:0"
+  );
+
+  if (keepAudio) {
+    ffmpegArgs.push("-map", probe.audioStream ? "0:a:0" : "1:a:0");
+  } else {
+    ffmpegArgs.push("-an");
+  }
+
+  ffmpegArgs.push(
+    "-shortest",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-r",
+    String(fps)
+  );
+
+  if (keepAudio) {
+    ffmpegArgs.push("-c:a", "aac", "-ar", "48000", "-ac", "2");
+  }
+
+  ffmpegArgs.push(outputPath);
+  await execFile("ffmpeg", ffmpegArgs);
+
+  const normalizedProbe = await probeVideo(outputPath);
+  return {
+    path: outputPath,
+    durationSeconds: roundNumber(normalizedProbe.durationSeconds, 3) || 0,
+    hasAudio: Boolean(normalizedProbe.audioStream)
+  };
+}
+
+function computeSafeTransitionDuration(segmentDurations, requestedDuration) {
+  const finiteDurations = segmentDurations.filter((duration) => Number.isFinite(duration) && duration > 0);
+  if (finiteDurations.length < 2) {
+    return 0;
+  }
+
+  const requested = Number.isFinite(requestedDuration) ? requestedDuration : 0.4;
+  const maxAllowed = Math.min(...finiteDurations.map((duration) => duration / 3));
+  return roundNumber(Math.max(0, Math.min(requested, maxAllowed)), 3);
+}
+
+async function composeDemoVideo(clips, options = {}) {
+  if (!Array.isArray(clips) || clips.length === 0) {
+    throw new Error("compose_demo_video requires at least one clip.");
+  }
+
+  const width = Number.isFinite(options.width) ? options.width : 1440;
+  const height = Number.isFinite(options.height) ? options.height : 900;
+  const fps = Number.isFinite(options.fps) ? options.fps : 30;
+  const keepAudio = options.keepAudio !== false;
+  const keepAssets = options.keepAssets === true;
+  const cardDuration = Number.isFinite(options.cardDuration) ? options.cardDuration : 1.8;
+  const labelCardDuration = Number.isFinite(options.labelCardDuration) ? options.labelCardDuration : 1.2;
+  const transition = options.transition || "fade";
+  const stamp = new Date().toISOString().replaceAll(":", "-");
+  const defaultOutputPath = path.join(os.homedir(), "Movies", "Codex Recordings", `demo-${stamp}.mp4`);
+  const outputPath = path.resolve(expandHome(options.outputPath || defaultOutputPath));
+  const workDir = path.join(path.dirname(outputPath), `${sanitizeFileStem(outputPath)}-assets`);
+  ensureDir(workDir);
+
+  const segments = [];
+
+  if (options.introTitle) {
+    const introPath = path.join(workDir, "segment-000-intro.mp4");
+    await createTitleCardClip(introPath, {
+      width,
+      height,
+      fps,
+      duration: cardDuration,
+      keepAudio,
+      title: options.introTitle,
+      subtitle: options.introSubtitle
+    });
+    const probe = await probeVideo(introPath);
+    segments.push({
+      kind: "intro",
+      path: introPath,
+      durationSeconds: probe.durationSeconds,
+      hasAudio: Boolean(probe.audioStream)
+    });
+  }
+
+  for (let index = 0; index < clips.length; index += 1) {
+    const clip = clips[index];
+    if (!clip?.inputPath) {
+      throw new Error(`Clip ${index + 1} is missing inputPath.`);
+    }
+
+    if (clip.label) {
+      const labelPath = path.join(workDir, `segment-${String(segments.length).padStart(3, "0")}-label.mp4`);
+      await createTitleCardClip(labelPath, {
+        width,
+        height,
+        fps,
+        duration: labelCardDuration,
+        keepAudio,
+        title: clip.label,
+        subtitle: clip.subtitle
+      });
+      const probe = await probeVideo(labelPath);
+      segments.push({
+        kind: "label",
+        path: labelPath,
+        durationSeconds: probe.durationSeconds,
+        hasAudio: Boolean(probe.audioStream)
+      });
+    }
+
+    const normalizedPath = path.join(workDir, `segment-${String(segments.length).padStart(3, "0")}-clip.mp4`);
+    const normalized = await normalizeClip(clip.inputPath, normalizedPath, {
+      width,
+      height,
+      fps,
+      keepAudio,
+      startTime: clip.startTime,
+      endTime: clip.endTime
+    });
+    segments.push({
+      kind: "clip",
+      path: normalized.path,
+      durationSeconds: normalized.durationSeconds,
+      hasAudio: normalized.hasAudio
+    });
+  }
+
+  if (options.outroTitle) {
+    const outroPath = path.join(workDir, `segment-${String(segments.length).padStart(3, "0")}-outro.mp4`);
+    await createTitleCardClip(outroPath, {
+      width,
+      height,
+      fps,
+      duration: cardDuration,
+      keepAudio,
+      title: options.outroTitle,
+      subtitle: options.outroSubtitle
+    });
+    const probe = await probeVideo(outroPath);
+    segments.push({
+      kind: "outro",
+      path: outroPath,
+      durationSeconds: probe.durationSeconds,
+      hasAudio: Boolean(probe.audioStream)
+    });
+  }
+
+  if (segments.length === 0) {
+    throw new Error("No segments were created for compose_demo_video.");
+  }
+
+  if (segments.length === 1) {
+    fs.copyFileSync(segments[0].path, outputPath);
+    const finalProbe = await probeVideo(outputPath);
+    if (!keepAssets) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+    return {
+      outputPath,
+      transition: "none",
+      segmentCount: 1,
+      durationSeconds: roundNumber(finalProbe.durationSeconds, 3),
+      keptAssets: keepAssets,
+      assetDir: keepAssets ? workDir : null
+    };
+  }
+
+  const includeAudio = keepAudio && segments.every((segment) => segment.hasAudio);
+  const safeTransitionDuration = transition === "none"
+    ? 0
+    : computeSafeTransitionDuration(
+      segments.map((segment) => segment.durationSeconds),
+      options.transitionDuration
+    );
+
+  const ffmpegArgs = ["-y"];
+  for (const segment of segments) {
+    ffmpegArgs.push("-i", segment.path);
+  }
+
+  const filterParts = [];
+  if (safeTransitionDuration <= 0) {
+    if (includeAudio) {
+      const concatInputs = segments.map((_, index) => `[${index}:v][${index}:a]`).join("");
+      filterParts.push(`${concatInputs}concat=n=${segments.length}:v=1:a=1[vout][aout]`);
+    } else {
+      const concatInputs = segments.map((_, index) => `[${index}:v]`).join("");
+      filterParts.push(`${concatInputs}concat=n=${segments.length}:v=1:a=0[vout]`);
+    }
+  } else {
+    let currentVideoLabel = "0:v";
+    let currentAudioLabel = includeAudio ? "0:a" : null;
+    let currentTimelineDuration = segments[0].durationSeconds;
+
+    for (let index = 1; index < segments.length; index += 1) {
+      const videoOut = `vxf${index}`;
+      const audioOut = `axf${index}`;
+      const offset = roundNumber(Math.max(0, currentTimelineDuration - safeTransitionDuration), 3);
+      filterParts.push(
+        `[${currentVideoLabel}][${index}:v]xfade=transition=${transition}:duration=${safeTransitionDuration}:offset=${offset}[${videoOut}]`
+      );
+
+      if (includeAudio) {
+        filterParts.push(
+          `[${currentAudioLabel}][${index}:a]acrossfade=d=${safeTransitionDuration}:c1=tri:c2=tri[${audioOut}]`
+        );
+      }
+
+      currentVideoLabel = videoOut;
+      currentAudioLabel = includeAudio ? audioOut : null;
+      currentTimelineDuration += segments[index].durationSeconds - safeTransitionDuration;
+    }
+
+    filterParts.push(`[${currentVideoLabel}]copy[vout]`);
+    if (includeAudio) {
+      filterParts.push(`[${currentAudioLabel}]acopy[aout]`);
+    }
+  }
+
+  ffmpegArgs.push(
+    "-filter_complex",
+    filterParts.join(";"),
+    "-map",
+    "[vout]"
+  );
+
+  if (includeAudio) {
+    ffmpegArgs.push("-map", "[aout]");
+  }
+
+  ffmpegArgs.push(
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    "-preset",
+    "veryfast"
+  );
+
+  if (includeAudio) {
+    ffmpegArgs.push(
+      "-c:a",
+      "aac",
+      "-ar",
+      "48000",
+      "-ac",
+      "2"
+    );
+  } else {
+    ffmpegArgs.push("-an");
+  }
+
+  ffmpegArgs.push(
+    outputPath
+  );
+
+  await execFile("ffmpeg", ffmpegArgs);
+  const finalProbe = await probeVideo(outputPath);
+  if (!keepAssets) {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+
+  return {
+    outputPath,
+    assetDir: keepAssets ? workDir : null,
+    keptAssets: keepAssets,
+    transition,
+    transitionDuration: safeTransitionDuration,
+    segmentCount: segments.length,
+    durationSeconds: roundNumber(finalProbe.durationSeconds, 3),
+    segments: segments.map((segment, index) => ({
+      index,
+      kind: segment.kind,
+      path: keepAssets ? segment.path : null,
+      durationSeconds: roundNumber(segment.durationSeconds, 3)
+    }))
+  };
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -573,6 +1065,48 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           sceneThreshold: { type: "number", default: 0.35 },
           maxSceneFrames: { type: "number", default: 8 },
           extractWaveform: { type: "boolean", default: true }
+        }
+      }
+    },
+    {
+      name: "compose_demo_video",
+      description: "Compose a polished demo MP4 from local clips with title cards and transitions.",
+      inputSchema: {
+        type: "object",
+        required: ["clips"],
+        properties: {
+          clips: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["inputPath"],
+              properties: {
+                inputPath: { type: "string" },
+                startTime: { type: "number" },
+                endTime: { type: "number" },
+                label: { type: "string" },
+                subtitle: { type: "string" }
+              }
+            }
+          },
+          outputPath: { type: "string" },
+          width: { type: "number", default: 1440 },
+          height: { type: "number", default: 900 },
+          fps: { type: "number", default: 30 },
+          keepAudio: { type: "boolean", default: true },
+          transition: {
+            type: "string",
+            enum: ["none", "fade", "wipeleft", "wiperight", "slideleft", "slideright", "circleopen", "circleclose"],
+            default: "fade"
+          },
+          transitionDuration: { type: "number", default: 0.4 },
+          introTitle: { type: "string" },
+          introSubtitle: { type: "string" },
+          outroTitle: { type: "string" },
+          outroSubtitle: { type: "string" },
+          cardDuration: { type: "number", default: 1.8 },
+          labelCardDuration: { type: "number", default: 1.2 },
+          keepAssets: { type: "boolean", default: false }
         }
       }
     }
@@ -764,6 +1298,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "analyze_video") {
     return textResult(await analyzeVideo(args.inputPath, args));
+  }
+
+  if (name === "compose_demo_video") {
+    return textResult(await composeDemoVideo(args.clips, args));
   }
 
   throw new Error(`Unknown tool: ${name}`);
