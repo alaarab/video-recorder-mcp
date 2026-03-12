@@ -6,6 +6,7 @@ Record product demos without rebuilding the same automation stack in every repo.
 
 - browser demo recording with Playwright
 - desktop screen capture on macOS with `ffmpeg`
+- video analysis with `ffprobe` and frame extraction
 
 It is designed for Codex-style workflows where an agent can drive a browser, interact with an app, and leave behind a real video artifact instead of a pile of screenshots.
 
@@ -40,6 +41,7 @@ This server closes that gap.
 - closes browser sessions and exports a final video
 - transcodes browser recordings to `.mp4` when the output path ends in `.mp4`
 - starts and stops macOS screen recording through `ffmpeg`
+- analyzes recorded videos into metadata, sampled frames, scene cuts, contact sheets, and audio waveforms
 - defaults output to `~/Movies/Codex Recordings`
 
 ## Requirements
@@ -102,6 +104,7 @@ If you installed it globally through npm, point `args` to the installed entrypoi
 - `browser_wait_for`
 - `browser_screenshot`
 - `close_browser_session`
+- `analyze_video`
 
 ## Typical Workflows
 
@@ -126,11 +129,24 @@ If `saveAs` ends in `.mp4`, the server will transcode the Playwright WebM output
 
 This is especially useful when paired with tools like `LiveMCP` for Ableton Live demos.
 
+### Video Analysis
+
+1. Point `analyze_video` at a local `.mp4`, `.mov`, or `.webm`
+2. The tool writes an analysis bundle to disk
+3. Review:
+
+- `analysis.json` for metadata and timestamps
+- `frames/` for evenly sampled stills
+- `scene-cuts/` for scene-change frames
+- `contact-sheet.png` for a quick visual overview
+- `waveform.png` when the file contains audio
+
 ## Example Use Cases
 
 - “Open the staging site, log in, create a project, and save a 20-second demo MP4.”
 - “Start screen capture, tweak the plugin in Ableton, and save the recording to Movies.”
 - “Take a screenshot halfway through the flow, then continue and export the final browser video.”
+- “Analyze a recorded demo and show me where dead time, scene changes, or sensitive screens appear.”
 
 ## Output
 
@@ -141,6 +157,12 @@ By default, recordings land in:
 ```
 
 You can override output paths per tool call.
+
+Video analysis bundles land under:
+
+```text
+~/Movies/Codex Recordings/video-analysis
+```
 
 ## Current Limits
 

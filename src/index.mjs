@@ -174,6 +174,253 @@ async function closeBrowserSession(sessionId, saveAs) {
   };
 }
 
+function sanitizeFileStem(filePath) {
+  return path.basename(filePath, path.extname(filePath)).replace(/[^a-zA-Z0-9._-]+/g, "-");
+}
+
+function parseFrameRate(rate) {
+  if (!rate || typeof rate !== "string") {
+    return null;
+  }
+
+  if (!rate.includes("/")) {
+    const value = Number(rate);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  const [num, den] = rate.split("/").map(Number);
+  if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) {
+    return null;
+  }
+
+  return num / den;
+}
+
+function roundNumber(value, places = 3) {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  const factor = 10 ** places;
+  return Math.round(value * factor) / factor;
+}
+
+function timestampForFilename(seconds) {
+  const totalMs = Math.max(0, Math.round(seconds * 1000));
+  const hours = Math.floor(totalMs / 3600000);
+  const minutes = Math.floor((totalMs % 3600000) / 60000);
+  const secs = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+  return [hours, minutes, secs].map((part) => String(part).padStart(2, "0")).join("-") + `-${String(ms).padStart(3, "0")}`;
+}
+
+function sampleTimestamps(durationSeconds, sampleCount) {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return [0];
+  }
+
+  const count = Math.max(1, Math.min(24, Math.floor(sampleCount || 9)));
+  const step = durationSeconds / (count + 1);
+  const timestamps = [];
+
+  for (let index = 1; index <= count; index += 1) {
+    timestamps.push(roundNumber(step * index, 3));
+  }
+
+  return timestamps;
+}
+
+async function probeVideo(inputPath) {
+  const { stdout } = await execFile("ffprobe", [
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_format",
+    "-show_streams",
+    inputPath
+  ]);
+
+  const probe = JSON.parse(stdout);
+  const videoStream = (probe.streams || []).find((stream) => stream.codec_type === "video") || null;
+  const audioStream = (probe.streams || []).find((stream) => stream.codec_type === "audio") || null;
+  const durationSeconds = Number(probe.format?.duration || videoStream?.duration || 0);
+
+  return {
+    raw: probe,
+    durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : 0,
+    formatName: probe.format?.format_name || null,
+    sizeBytes: Number(probe.format?.size || 0) || 0,
+    bitRate: Number(probe.format?.bit_rate || 0) || 0,
+    videoStream,
+    audioStream,
+    width: videoStream?.width || null,
+    height: videoStream?.height || null,
+    frameRate: parseFrameRate(videoStream?.avg_frame_rate || videoStream?.r_frame_rate),
+    videoCodec: videoStream?.codec_name || null,
+    audioCodec: audioStream?.codec_name || null
+  };
+}
+
+async function extractFrameAtTimestamp(inputPath, timestampSeconds, outputPath) {
+  await execFile("ffmpeg", [
+    "-y",
+    "-ss",
+    String(timestampSeconds),
+    "-i",
+    inputPath,
+    "-frames:v",
+    "1",
+    outputPath
+  ]);
+}
+
+async function buildContactSheet(framesDir, outputPath, frameCount) {
+  const cols = Math.min(3, Math.max(1, Math.ceil(Math.sqrt(frameCount))));
+  const rows = Math.max(1, Math.ceil(frameCount / cols));
+
+  await execFile("ffmpeg", [
+    "-y",
+    "-framerate",
+    "1",
+    "-i",
+    path.join(framesDir, "frame-%03d.png"),
+    "-frames:v",
+    "1",
+    "-vf",
+    `scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2:color=black,tile=${cols}x${rows}:padding=8:margin=8`,
+    outputPath
+  ]);
+}
+
+async function detectScenes(inputPath, outputDir, threshold, maxSceneFrames) {
+  const sceneDir = path.join(outputDir, "scene-cuts");
+  ensureDir(sceneDir);
+  const safeThreshold = Number.isFinite(threshold) ? threshold : 0.35;
+  const safeMaxSceneFrames = Math.max(1, Math.min(24, Math.floor(maxSceneFrames || 8)));
+
+  try {
+    const { stderr } = await execFile("ffmpeg", [
+      "-y",
+      "-i",
+      inputPath,
+      "-vf",
+      `select='gt(scene,${safeThreshold})',showinfo`,
+      "-fps_mode",
+      "vfr",
+      "-frames:v",
+      String(safeMaxSceneFrames),
+      path.join(sceneDir, "scene-%03d.png")
+    ]);
+
+    const timestamps = Array.from(stderr.matchAll(/pts_time:([0-9.]+)/g)).map((match) => Number(match[1]));
+    return timestamps.slice(0, safeMaxSceneFrames).map((timestamp, index) => ({
+      timestampSeconds: roundNumber(timestamp, 3),
+      path: path.join(sceneDir, `scene-${String(index + 1).padStart(3, "0")}.png`)
+    })).filter((scene) => fs.existsSync(scene.path));
+  } catch (error) {
+    const output = `${error.stdout || ""}\n${error.stderr || ""}`;
+    if (output.includes("Output file is empty")) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function createWaveformImage(inputPath, outputPath) {
+  await execFile("ffmpeg", [
+    "-y",
+    "-i",
+    inputPath,
+    "-filter_complex",
+    "aformat=channel_layouts=mono,showwavespic=s=1600x240:colors=white",
+    "-frames:v",
+    "1",
+    outputPath
+  ]);
+}
+
+async function analyzeVideo(inputPath, options = {}) {
+  const resolvedInputPath = path.resolve(expandHome(inputPath));
+  if (!fs.existsSync(resolvedInputPath)) {
+    throw new Error(`Video file not found: ${resolvedInputPath}`);
+  }
+
+  const stamp = new Date().toISOString().replaceAll(":", "-");
+  const defaultDir = path.join(
+    os.homedir(),
+    "Movies",
+    "Codex Recordings",
+    "video-analysis",
+    `${sanitizeFileStem(resolvedInputPath)}-${stamp}`
+  );
+  const outputDir = path.resolve(expandHome(options.outputDir || defaultDir));
+  const framesDir = path.join(outputDir, "frames");
+  ensureDir(framesDir);
+
+  const probe = await probeVideo(resolvedInputPath);
+  const timestamps = sampleTimestamps(probe.durationSeconds, options.sampleCount);
+  const sampleFrames = [];
+
+  for (let index = 0; index < timestamps.length; index += 1) {
+    const timestampSeconds = timestamps[index];
+    const framePath = path.join(framesDir, `frame-${String(index + 1).padStart(3, "0")}.png`);
+    await extractFrameAtTimestamp(resolvedInputPath, timestampSeconds, framePath);
+    sampleFrames.push({
+      index: index + 1,
+      timestampSeconds,
+      timestampLabel: timestampForFilename(timestampSeconds),
+      path: framePath
+    });
+  }
+
+  let contactSheetPath = null;
+  if (sampleFrames.length > 0 && options.createContactSheet !== false) {
+    contactSheetPath = path.join(outputDir, "contact-sheet.png");
+    await buildContactSheet(framesDir, contactSheetPath, sampleFrames.length);
+  }
+
+  let waveformPath = null;
+  if (probe.audioStream && options.extractWaveform !== false) {
+    waveformPath = path.join(outputDir, "waveform.png");
+    await createWaveformImage(resolvedInputPath, waveformPath);
+  }
+
+  const scenes = options.detectScenes === false
+    ? []
+    : await detectScenes(
+      resolvedInputPath,
+      outputDir,
+      options.sceneThreshold,
+      options.maxSceneFrames
+    );
+
+  const manifest = {
+    inputPath: resolvedInputPath,
+    outputDir,
+    generatedAt: new Date().toISOString(),
+    metadata: {
+      formatName: probe.formatName,
+      sizeBytes: probe.sizeBytes,
+      bitRate: probe.bitRate,
+      durationSeconds: roundNumber(probe.durationSeconds, 3),
+      width: probe.width,
+      height: probe.height,
+      frameRate: roundNumber(probe.frameRate, 3),
+      videoCodec: probe.videoCodec,
+      audioCodec: probe.audioCodec,
+      hasAudio: Boolean(probe.audioStream)
+    },
+    sampleFrames,
+    scenes,
+    contactSheetPath,
+    waveformPath
+  };
+
+  fs.writeFileSync(path.join(outputDir, "analysis.json"), JSON.stringify(manifest, null, 2));
+  return manifest;
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -308,6 +555,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           sessionId: { type: "string" },
           saveAs: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "analyze_video",
+      description: "Analyze a local video file with ffprobe, extract evenly sampled frames, detect scene cuts, and generate a contact sheet plus waveform.",
+      inputSchema: {
+        type: "object",
+        required: ["inputPath"],
+        properties: {
+          inputPath: { type: "string" },
+          outputDir: { type: "string" },
+          sampleCount: { type: "number", default: 9 },
+          createContactSheet: { type: "boolean", default: true },
+          detectScenes: { type: "boolean", default: true },
+          sceneThreshold: { type: "number", default: 0.35 },
+          maxSceneFrames: { type: "number", default: 8 },
+          extractWaveform: { type: "boolean", default: true }
         }
       }
     }
@@ -495,6 +760,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "close_browser_session") {
     return textResult(await closeBrowserSession(args.sessionId, args.saveAs));
+  }
+
+  if (name === "analyze_video") {
+    return textResult(await analyzeVideo(args.inputPath, args));
   }
 
   throw new Error(`Unknown tool: ${name}`);
