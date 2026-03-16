@@ -1,7 +1,7 @@
 {
   "name": "@alaarab/video-recorder-mcp",
-  "version": "0.4.0",
-  "description": "MCP server for recording, analyzing, and editing demo videos",
+  "version": "0.5.0",
+  "description": "MCP server for recording bug repros, feature demos, clips, and GIFs",
   "type": "module",
   "license": "MIT",
   "author": "alaarab",
@@ -9,6 +9,9 @@
     "mcp",
     "video",
     "demo",
+    "gif",
+    "bug-report",
+    "feature-demo",
     "screen-recording",
     "playwright",
     "ffmpeg"
@@ -31,7 +34,8 @@
     "video-recorder-mcp": "bin/video-recorder-mcp"
   },
   "scripts": {
-    "start": "node ./src/index.mjs"
+    "start": "node ./src/index.mjs",
+    "check": "node --check ./src/index.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.1",
